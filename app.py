@@ -26,6 +26,8 @@ from utils.retrain import (
     retrain_with_mlflow,
     MODELS,
 )
+from utils.costs import estimate_drift_cost, estimate_retrain_cost, make_retrain_decision
+from utils.drift_analysis import analyze_drift_topology
 from utils.plots import (
     plot_distribution_comparison,
     plot_drift_summary,
@@ -412,8 +414,8 @@ with tab_perf:
 with tab_retrain:
     st.header("Retrain & Model Registry")
 
-    # ── Decision summary ─────────────────────────────────────────
-    st.subheader("Decision summary")
+    # ── Decision summary with cost analysis ──────────────────────
+    st.subheader("🔍 Drift Analysis & Retrain Decision")
 
     drift_detected = drift_result.overall_drift if drift_result is not None else False
     perf_dropped = False
@@ -423,6 +425,61 @@ with tab_retrain:
             st.session_state["ref_perf"], st.session_state["curr_perf"]
         )
         perf_dropped = any(d["degraded"] for d in _drops.values())
+
+    # Analyze drift topology
+    topology = analyze_drift_topology(
+        drift_result=drift_result,
+        ref_perf=st.session_state.get("ref_perf"),
+        curr_perf=st.session_state.get("curr_perf"),
+        perf_threshold=0.05,
+    )
+
+    # Display drift topology
+    st.subheader("Drift Topology")
+    col1, col2 = st.columns(2)
+    col1.metric("Drift Type", topology.drift_type)
+    col2.metric("Data Drift Severity", topology.data_drift_severity)
+    st.metric("Model/Concept Drift Severity", topology.model_drift_severity)
+    st.info(f"**Interpretation:** {topology.interpretation}")
+    st.write(f"**Action suggested:** {topology.action_suggested}")
+
+    # Estimate business cost of drift
+    st.divider()
+    st.subheader("💰 Cost-Benefit Analysis")
+
+    if "curr_perf" in st.session_state and "ref_perf" in st.session_state:
+        # Estimate impact of drift (assuming 10,000 events as example)
+        n_events = len(curr_df)  # Can be parameterized later
+        cost_per_error = 10  # Currency units; can be adjusted
+
+        drift_cost = estimate_drift_cost(
+            st.session_state["ref_perf"],
+            st.session_state["curr_perf"],
+            n_events=n_events,
+            cost_per_error=cost_per_error,
+            task_type=st.session_state.get("task_type", "classification"),
+        )
+
+        # Estimate cost of retraining
+        # Use a default model for cost estimation (Random Forest)
+        retrain_cost = estimate_retrain_cost(
+            model_name="Random Forest",
+            n_samples=len(curr_df),
+            hourly_cost=50,
+            human_review_hours=2,
+        )
+
+        # Make cost-based decision
+        cost_decision = make_retrain_decision(drift_cost, retrain_cost, threshold_ratio=1.5)
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Est. Drift Cost (over ~10k events)", f"{drift_cost:,.0f} units")
+        col2.metric("Est. Retrain Cost", f"{retrain_cost:,.0f} units")
+        col3.metric("Net Benefit of Retrain", f"{cost_decision.net_benefit:,.0f} units")
+
+        st.info(f"💡 {cost_decision.recommendation}")
+    else:
+        st.warning("Run Performance evaluation first to estimate drift cost.")
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Drift status", "⚠️ YES" if drift_detected else "✅ NO")
@@ -515,6 +572,45 @@ with tab_retrain:
                     mcols = st.columns(len(result.metrics))
                     for i, (k, v) in enumerate(result.metrics.items()):
                         mcols[i].metric(k, f"{v:.4f}")
+
+                    # Evaluate retrained model on Current dataset and compare
+                    # with previous metrics (if available)
+                    new_curr_perf = None
+                    if mode == "supervised" and target_col:
+                        try:
+                            X_curr_eval, y_curr_eval, _ = prepare_features(
+                                curr_df, target_col, feature_cols
+                            )
+                            X_curr_eval = align_features(X, X_curr_eval)
+                            new_curr_perf = evaluate_model(
+                                result.model, X_curr_eval, y_curr_eval, task_type
+                            )
+                            st.session_state["retrain_curr_perf"] = new_curr_perf
+                        except Exception as e:
+                            st.warning(
+                                f"Retrained model evaluation on Current failed: {e}"
+                            )
+
+                    if new_curr_perf is not None and "curr_perf" in st.session_state:
+                        st.subheader("Current dataset — old vs new metrics")
+                        old_perf = st.session_state["curr_perf"]
+                        rows = []
+                        for metric_name, new_val in new_curr_perf.metrics.items():
+                            old_val = old_perf.metrics.get(metric_name)
+                            change = (
+                                new_val - old_val if old_val is not None else None
+                            )
+                            rows.append(
+                                {
+                                    "Metric": metric_name,
+                                    "Old": round(old_val, 4)
+                                    if old_val is not None
+                                    else "—",
+                                    "New": round(new_val, 4),
+                                    "Change": f"{change:+.4f}" if change is not None else "—",
+                                }
+                            )
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True)
 
                 except Exception as e:
                     st.error(f"Retrain failed: {e}")
