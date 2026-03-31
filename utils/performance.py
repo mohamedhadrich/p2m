@@ -58,19 +58,44 @@ def check_performance_drop(
     curr_result: PerformanceResult,
     threshold: float = 0.05,
 ) -> dict:
-    """Compare reference vs current metrics and flag degradation."""
+    """Compare reference vs current metrics and flag degradation.
+
+    Convention: change = (curr - ref) / ref (uniform for all metrics)
+
+    Interpretation:
+    - ERROR metrics (RMSE, MAE, MSE): negative change = improvement ✅
+    - SCORE metrics (R², Accuracy, F1): positive change = improvement ✅
+    """
     drops = {}
+    primary_metric_improved = False
+
+    # First pass: check if primary error metric improved
+    if "RMSE" in ref_result.metrics:
+        ref_rmse = ref_result.metrics["RMSE"]
+        curr_rmse = curr_result.metrics["RMSE"]
+        rmse_change = (curr_rmse - ref_rmse) / max(abs(ref_rmse), 1e-8)
+        # For error metrics: negative = improvement
+        if rmse_change < 0:
+            primary_metric_improved = True
+
+    # Second pass: calculate all metrics with uniform formula
     for name in ref_result.metrics:
         ref_val = ref_result.metrics[name]
         curr_val = curr_result.metrics[name]
 
-        # For error metrics, increase = worse
+        # Uniform formula for all metrics
+        change = (curr_val - ref_val) / max(abs(ref_val), 1e-8)
+
+        # Interpret degradation based on metric type
         if name in ("MSE", "MAE", "RMSE"):
-            change = (curr_val - ref_val) / max(abs(ref_val), 1e-8)
+            # Error metrics: negative = improvement, positive = degradation
             degraded = change > threshold
         else:
-            change = (ref_val - curr_val) / max(abs(ref_val), 1e-8)
-            degraded = change > threshold
+            # Score metrics: positive = improvement, negative = degradation
+            degraded = change < -threshold
+            # Ignore R² degradation if RMSE improved (regression robustness)
+            if name == "R²" and primary_metric_improved:
+                degraded = False
 
         drops[name] = {
             "ref": round(ref_val, 4),

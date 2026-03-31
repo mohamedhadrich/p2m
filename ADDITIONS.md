@@ -203,6 +203,168 @@ C'est exactement ce que demande un vrai système MLOps en production.
 
 ---
 
+## 4. **Intelligent Model Recommendation System** — `find_best_model_and_params()`
+
+### Quoi ?
+Une nouvelle fonctionnalité automatisée qui teste **tous les modèles disponibles** avec différentes **combinaisons d'hyperparamètres** et recommande les meilleurs selon leur performance en cross-validation.
+
+### Fonctionnalités principales :
+
+- **`find_best_model_and_params(...)`** dans `utils/retrain.py`
+  - Tests 15 modèles (8 classification + 7 regression) :
+    - Logistic Regression, Random Forest, Gradient Boosting, SVM, KNN, Decision Tree, Naive Bayes, AdaBoost, Linear Regression, SVR, KNeighborsRegressor, DecisionTreeRegressor, AdaBoostRegressor, etc.
+  - Pour chaque modèle, teste 2-3 combinaisons d'hyperparamètres.
+  - Utilise **cross-validation** (3-5 folds) pour évaluer la performance réelle.
+  - Retourne une **liste triée de ModelRecommendation** avec score, std, et time.
+  - Supporte **quick_mode** pour tests rapides (1 paramètre par modèle).
+
+- **Paramètre grids prédéfinis** :
+  ```
+  Logistic Regression: C ∈ [0.1, 1.0, 10.0]
+  Random Forest: n_estimators ∈ [50, 100, 200], max_depth ∈ [5, 10, 15]
+  Gradient Boosting: n_estimators ∈ [50, 100], learning_rate=0.1
+  SVM: kernel ∈ [rbf, linear], C=1.0
+  K-Nearest Neighbors: n_neighbors ∈ [3, 5], weights ∈ [uniform, distance]
+  ... (et autres)
+  ```
+
+### Intégration dans l'UI (Tab 5 - Retrain) :
+
+**Section : "🎯 Find Best Model & Parameters"**
+
+1. **Quick Search Controls**
+   - ⚡ Checkbox "Quick mode (faster)" → teste 1 param par modèle au lieu de 3
+   - 🔍 Bouton "Find Best Model" → lance la recherche
+
+2. **Results Display**
+   - Table "Top 5 Recommended Models" avec colonnes :
+     - Rank, Model, CV Score, Std, Time (s)
+   - 🏆 "Best Recommendation" card affichant :
+     - Nom du meilleur modèle
+     - Score CV ± std
+     - Paramètres recommandés
+
+3. **Selection & Application**
+   - Checkbox "✅ Use the best recommendation" → auto-sélectionne le meilleur
+   - Ou choix manuel dans la dropdown
+   - Les paramètres recommandés sont **auto-populés** dans "⚙️ Customize hyperparameters"
+   - Optionnel : l'utilisateur peut **override** les paramètres
+
+4. **Training & Logging**
+   - `retrain_with_mlflow()` reçoit les `custom_params` recommandés
+   - MLflow enregistre chaque paramètre custom avec la clé `custom_{param_name}`
+   - Run name = `retrain-{ModelName}`
+
+### Avantages :
+
+✅ **Objectif** : Pas de "guess" sur le meilleur modèle ; c'est basé sur CV scores
+✅ **Automatisé** : 15 modèles × 2-3 params = ~40 combinaisons testées en quelques secondes
+✅ **Reproductible** : Même dataset → même recommandation
+✅ **Utilisateur-friendly** : Un clic pour découvrir le meilleur modèle
+✅ **Tracé** : Tous les params testés sont loggés dans MLflow
+
+### Exemple d'usage :
+
+```
+1. User upload Reference + Current datasets
+2. User click "Tab 5 - Retrain"
+3. User click "🔍 Find Best Model"
+   → App tests 30+ combinations in ~10 seconds
+4. Table shows:
+   #1 Random Forest (CV Score: 0.9234 ± 0.0051, Time: 2.3s)
+   #2 Gradient Boosting (CV Score: 0.9187 ± 0.0062, Time: 3.1s)
+   #3 SVM (CV Score: 0.9045 ± 0.0098, Time: 1.8s)
+   ...
+5. User sees "🏆 Best: Random Forest with params {n_estimators: 100, max_depth: 10}"
+6. User checks "✅ Use the best recommendation"
+7. User clicks "Retrain model"
+8. MLflow logs:
+   - model_name: Random Forest
+   - custom_n_estimators: 100
+   - custom_max_depth: 10
+   - ... (other params)
+```
+
+---
+
+## 5. **Convention Uniforme de Calcul: `change = (curr - ref) / ref`**
+
+### Quoi?
+Une convention cohérente à travers tout le projet pour calculer le changement en pourcentage d'une métrique.
+
+### Formule:
+```python
+change = (current_value - reference_value) / reference_value
+```
+
+### Interprétation par type de métrique:
+
+**Pour les métriques d'ERREUR (RMSE, MAE, MSE):**
+- `change < 0` → 🟢 **Amélioration** (erreur diminue)
+- `change > 0` → 🔴 **Dégradation** (erreur augmente)
+
+**Pour les métriques de SCORE (R², Accuracy, F1):**
+- `change > 0` → 🟢 **Amélioration** (score augmente)
+- `change < 0` → 🔴 **Dégradation** (score diminue)
+
+### Exemple appliqué:
+```
+RMSE: 83.5 (ref) → 67.8 (curr)
+change = (67.8 - 83.5) / 83.5 = -0.188 = -18.8% ✅ Amélioration!
+
+R²: 0.8619 (ref) → 0.5703 (curr)
+change = (0.5703 - 0.8619) / 0.8619 = -0.338 = -33.8% ❌ Dégradation (mais ignorée si RMSE améli)
+```
+
+### Où s'applique?
+- ✅ `utils/performance.py:check_performance_drop()`
+- ✅ `utils/drift_analysis.py:analyze_drift_topology()`
+- ✅ Affichage dans l'UI Streamlit (Tab 3 & 4)
+
+### Avantage:
+- 🎯 **Une seule formule** pour tous les calculs
+- 🎯 **Cohérent** et facile à comprendre
+- 🎯 **Pas d'inversion de signe** confuse
+
+---
+
+## 6. **Déterminisme & Reproductibilité: `random_state=42`**
+
+### Problème:
+Lorsque vous cliquez sur "Retrain" deux fois avec les **mêmes données et le même modèle**, les métriques changent. C'est parce que la cross-validation mélange les données aléatoirement à chaque exécution.
+
+### Solution:
+**Fixer `random_state=42`** pour tous les CV (cross-validation):
+
+```python
+# ❌ AVANT (non-déterministe)
+cv_scores = cross_val_score(model, X, y, cv=5, scoring=scoring)  # cv=5 = folds aléatoires
+
+# ✅ APRÈS (déterministe)
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+cv_scores = cross_val_score(model, X, y, cv=kf, scoring=scoring)  # cv=kf = folds fixes
+```
+
+### Où appliqué:
+- ✅ `utils/retrain.py:retrain_with_mlflow()` (ligne ~316)
+- ✅ `utils/retrain.py:find_best_model_and_params()` (lignes ~523 et ~557)
+
+### Avantaise:
+- ✨ **Résultats reproductibles** - même résultat chaque fois
+- ✨ **Debugging facile** - les variations ne sont pas dues au hasard
+- ✨ **Comparaisons justes** - peut comparer deux modèles sans fluctuations aléatoires
+
+### Exemple:
+```
+Run 1: Model X → CV Score = 0.8234
+Run 2: Model X → CV Score = 0.8234 ✅ (identique!)
+
+Run 1: Model Y → CV Score = 0.8190
+Run 2: Model Y → CV Score = 0.8190 ✅ (identique!)
+```
+
+---
+
 ## 🚀 Next steps (optionnel)
 
 Si tu veux aller plus loin après ce P2M :

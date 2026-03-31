@@ -60,8 +60,23 @@ def chi2_test(reference: pd.Series, current: pd.Series):
     ref_arr = np.array([ref_counts.get(c, 0) for c in all_cats], dtype=float)
     curr_arr = np.array([curr_counts.get(c, 0) for c in all_cats], dtype=float)
 
-    # Add 1 to avoid zeros
-    stat, pvalue = stats.chisquare(curr_arr + 1, f_exp=ref_arr + 1)
+    # Avoid zero frequency issue: add pseudocount
+    ref_arr = ref_arr + 1
+    curr_arr = curr_arr + 1
+
+    # Normalize expected frequencies to match observed sum
+    ref_arr = ref_arr * (curr_arr.sum() / ref_arr.sum())
+
+    # Filter out zero categories to avoid chi2 issues
+    mask = (curr_arr > 0) | (ref_arr > 0)
+    curr_arr_filtered = curr_arr[mask]
+    ref_arr_filtered = ref_arr[mask]
+
+    if len(curr_arr_filtered) < 2:
+        # Not enough categories for chi2 test
+        return 0.0, 1.0
+
+    stat, pvalue = stats.chisquare(curr_arr_filtered, f_exp=ref_arr_filtered)
     return float(stat), float(pvalue)
 
 

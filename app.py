@@ -25,6 +25,10 @@ from utils.retrain import (
     train_model,
     retrain_with_mlflow,
     MODELS,
+    get_default_params,
+    get_parameter_info,
+    find_best_model_and_params,
+    format_recommendation_for_display,
 )
 from utils.costs import estimate_drift_cost, estimate_retrain_cost, make_retrain_decision
 from utils.drift_analysis import analyze_drift_topology
@@ -340,12 +344,77 @@ with tab_perf:
         selected_model = st.selectbox("Select model", model_options, key="perf_model")
         feature_cols = [c for c in work_cols if c != target_col]
 
+        # ── Hyperparameter customization for evaluation ──────────────
+        custom_params_eval = {}
+        with st.expander("⚙️ Customize hyperparameters (optional)", expanded=False):
+            st.write(f"**Model:** {selected_model}")
+
+            default_params = get_default_params(selected_model)
+
+            if selected_model == "Logistic Regression":
+                custom_params_eval["C"] = st.slider(
+                    "Regularization strength (C)", 0.1, 10.0, default_params.get("C", 1.0), 0.1, key="eval_C"
+                )
+                custom_params_eval["max_iter"] = st.slider(
+                    "Max iterations", 100, 5000, default_params.get("max_iter", 1000), 100, key="eval_max_iter"
+                )
+
+            elif selected_model in ["Random Forest", "Gradient Boosting"]:
+                custom_params_eval["n_estimators"] = st.slider(
+                    "Number of estimators", 10, 500, default_params.get("n_estimators", 100), 10, key="eval_n_est"
+                )
+                custom_params_eval["max_depth"] = st.slider(
+                    "Max depth", 2, 30, default_params.get("max_depth", 10), 1, key="eval_depth"
+                )
+                if selected_model == "Gradient Boosting":
+                    custom_params_eval["learning_rate"] = st.slider(
+                        "Learning rate", 0.01, 1.0, default_params.get("learning_rate", 0.1), 0.01, key="eval_lr"
+                    )
+
+            elif selected_model == "SVM":
+                custom_params_eval["kernel"] = st.selectbox(
+                    "Kernel", ["linear", "rbf", "poly"],
+                    index=["linear", "rbf", "poly"].index(default_params.get("kernel", "rbf")), key="eval_kernel"
+                )
+                custom_params_eval["C"] = st.slider(
+                    "Regularization (C)", 0.1, 100.0, default_params.get("C", 1.0), 0.1, key="eval_svm_c"
+                )
+
+            elif selected_model == "K-Nearest Neighbors":
+                custom_params_eval["n_neighbors"] = st.slider(
+                    "Number of neighbors", 1, 50, default_params.get("n_neighbors", 5), 1, key="eval_knn_n"
+                )
+                custom_params_eval["weights"] = st.selectbox(
+                    "Weights", ["uniform", "distance"],
+                    index=["uniform", "distance"].index(default_params.get("weights", "uniform")), key="eval_knn_w"
+                )
+
+            elif selected_model == "Decision Tree":
+                custom_params_eval["max_depth"] = st.slider(
+                    "Max depth", 2, 30, default_params.get("max_depth", 10), 1, key="eval_dt_depth"
+                )
+                custom_params_eval["min_samples_split"] = st.slider(
+                    "Min samples to split", 2, 20, default_params.get("min_samples_split", 5), 1, key="eval_dt_split"
+                )
+
+            elif selected_model == "AdaBoost":
+                custom_params_eval["n_estimators"] = st.slider(
+                    "Number of estimators", 10, 200, default_params.get("n_estimators", 50), 10, key="eval_ada_n"
+                )
+                custom_params_eval["learning_rate"] = st.slider(
+                    "Learning rate", 0.1, 2.0, default_params.get("learning_rate", 1.0), 0.1, key="eval_ada_lr"
+                )
+
+            # Display current parameters
+            st.write("**Current parameters:**")
+            st.json({**default_params, **custom_params_eval})
+
         if st.button("🚀 Train & Evaluate", key="train_eval"):
             # ── Train on Reference ──
             with st.spinner("Training model on Reference…"):
                 try:
                     X_ref, y_ref, _ = prepare_features(ref_df, target_col, feature_cols)
-                    model = train_model(X_ref, y_ref, task_type, selected_model)
+                    model = train_model(X_ref, y_ref, task_type, selected_model, custom_params=custom_params_eval)
                     ref_perf = evaluate_model(model, X_ref, y_ref, task_type)
 
                     st.session_state["trained_model"] = model
@@ -531,10 +600,180 @@ with tab_retrain:
         else:
             task_type = "classification"  # fallback for feature-only
 
-        model_options = list(MODELS[task_type].keys())
-        retrain_model_name = st.selectbox(
-            "Model for retrain", model_options, key="retrain_model"
-        )
+        # ── Find best model & params ────────────────────────────────────
+        st.subheader("🎯 Find Best Model & Parameters")
+
+        col1, col2 = st.columns(2)
+        use_quick_mode = col1.checkbox("⚡ Quick mode (faster)", value=True)
+        find_best = col2.button("🔍 Find Best Model", key="find_best_btn")
+
+        if find_best:
+            with st.spinner("Testing models and parameters... (this may take a moment)"):
+                try:
+                    feature_cols = [c for c in work_cols if c != target_col]
+                    X_analysis, y_analysis, _ = prepare_features(ref_df, target_col, feature_cols)
+
+                    # Find best models
+                    recommendations = find_best_model_and_params(
+                        X_analysis, y_analysis, task_type,
+                        cv_folds=3,
+                        quick_mode=use_quick_mode
+                    )
+
+                    if recommendations:
+                        st.success(f"✅ Found {len(recommendations)} model combinations!")
+
+                        # Display top 5 recommendations
+                        st.subheader("Top 5 Recommended Models")
+                        top_n = min(5, len(recommendations))
+
+                        display_data = []
+                        for i, rec in enumerate(recommendations[:top_n], 1):
+                            display_data.append({
+                                "Rank": f"#{i}",
+                                "Model": rec.model_name,
+                                "CV Score": f"{rec.cv_score:.4f}",
+                                "Std": f"{rec.cv_std:.4f}",
+                                "Time (s)": f"{rec.training_time:.2f}",
+                            })
+
+                        st.dataframe(pd.DataFrame(display_data), use_container_width=True)
+
+                        # Auto-select best model
+                        best_rec = recommendations[0]
+                        st.info(
+                            f"**🏆 Best Recommendation:** {best_rec.model_name}\n\n"
+                            f"Score: **{best_rec.cv_score:.4f}** ± {best_rec.cv_std:.4f}\n\n"
+                            f"Recommended parameters: `{best_rec.params}`"
+                        )
+
+                        # Store best recommendation in session
+                        st.session_state["best_recommendation"] = best_rec
+                        st.session_state["all_recommendations"] = recommendations
+
+                except Exception as e:
+                    st.error(f"Error finding best model: {e}")
+
+        # Display stored recommendations and select model
+        if "best_recommendation" in st.session_state:
+            st.divider()
+            best_rec = st.session_state["best_recommendation"]
+
+            # Use best recommendation checkbox
+            use_best = st.checkbox(
+                "✅ Use the best recommendation",
+                value=True,
+                key="use_best_recommendation"
+            )
+
+            if use_best:
+                retrain_model_name = best_rec.model_name
+                auto_params = best_rec.params
+                st.success(f"✅ Using: **{retrain_model_name}** with params {auto_params}")
+            else:
+                model_options = list(MODELS[task_type].keys())
+                retrain_model_name = st.selectbox(
+                    "Or choose another model manually", model_options, key="retrain_model"
+                )
+                auto_params = None
+        else:
+            auto_params = None
+            model_options = list(MODELS[task_type].keys())
+            retrain_model_name = st.selectbox(
+                "Model for retrain", model_options, key="retrain_model"
+            )
+
+        # ── Hyperparameter customization ────────────────────────────
+        with st.expander("⚙️ Customize hyperparameters (optional)", expanded=False):
+            st.write(f"**Model:** {retrain_model_name}")
+
+            default_params = get_default_params(retrain_model_name)
+
+            # Show recommended params if available
+            if auto_params and retrain_model_name == st.session_state.get("best_recommendation", {}).model_name:
+                st.info(f"📊 Automatically recommended params: {auto_params}")
+                use_auto = st.checkbox("✅ Apply recommended parameters", value=True, key="use_auto_params")
+                if use_auto:
+                    custom_params = auto_params.copy()
+                else:
+                    custom_params = {}
+                    defaults, param_info = get_parameter_info(retrain_model_name)
+            else:
+                use_auto = False
+                custom_params = {}
+                defaults, param_info = get_parameter_info(retrain_model_name)
+
+            if retrain_model_name == "Logistic Regression":
+                custom_params["C"] = st.slider(
+                    "Regularization strength (C)", 0.1, 10.0, default_params.get("C", 1.0), 0.1
+                )
+                custom_params["max_iter"] = st.slider(
+                    "Max iterations", 100, 5000, default_params.get("max_iter", 1000), 100
+                )
+
+            elif retrain_model_name in ["Random Forest", "Gradient Boosting"]:
+                custom_params["n_estimators"] = st.slider(
+                    "Number of estimators", 10, 500, default_params.get("n_estimators", 100), 10
+                )
+                custom_params["max_depth"] = st.slider(
+                    "Max depth", 2, 30, default_params.get("max_depth", 10), 1
+                )
+                if retrain_model_name == "Gradient Boosting":
+                    custom_params["learning_rate"] = st.slider(
+                        "Learning rate", 0.01, 1.0, default_params.get("learning_rate", 0.1), 0.01
+                    )
+
+            elif retrain_model_name == "SVM":
+                custom_params["kernel"] = st.selectbox(
+                    "Kernel", ["linear", "rbf", "poly"],
+                    index=["linear", "rbf", "poly"].index(default_params.get("kernel", "rbf"))
+                )
+                custom_params["C"] = st.slider(
+                    "Regularization (C)", 0.1, 100.0, default_params.get("C", 1.0), 0.1
+                )
+
+            elif retrain_model_name == "K-Nearest Neighbors":
+                custom_params["n_neighbors"] = st.slider(
+                    "Number of neighbors", 1, 50, default_params.get("n_neighbors", 5), 1
+                )
+                custom_params["weights"] = st.selectbox(
+                    "Weights", ["uniform", "distance"],
+                    index=["uniform", "distance"].index(default_params.get("weights", "uniform"))
+                )
+
+            elif retrain_model_name == "Decision Tree":
+                custom_params["max_depth"] = st.slider(
+                    "Max depth", 2, 30, default_params.get("max_depth", 10), 1
+                )
+                custom_params["min_samples_split"] = st.slider(
+                    "Min samples to split", 2, 20, default_params.get("min_samples_split", 5), 1
+                )
+
+            elif retrain_model_name == "AdaBoost":
+                custom_params["n_estimators"] = st.slider(
+                    "Number of estimators", 10, 200, default_params.get("n_estimators", 50), 10
+                )
+                custom_params["learning_rate"] = st.slider(
+                    "Learning rate", 0.1, 2.0, default_params.get("learning_rate", 1.0), 0.1
+                )
+
+            elif retrain_model_name == "LSTM":
+                custom_params["units"] = st.slider(
+                    "Units (LSTM layer)", 16, 128, default_params.get("units", 32), 16
+                )
+                custom_params["epochs"] = st.slider(
+                    "Epochs (training iterations)", 5, 50, default_params.get("epochs", 20), 1
+                )
+                custom_params["batch_size"] = st.selectbox(
+                    "Batch size",
+                    [16, 32, 64, 128],
+                    index=[16, 32, 64, 128].index(default_params.get("batch_size", 32))
+                )
+                st.info("💡 **LSTM Note**: This is a neural network model suitable for sequential/temporal patterns. Training may take longer.")
+
+            # Display current parameters
+            st.write("**Current parameters:**")
+            st.json({**defaults, **custom_params})
 
         if mode == "supervised":
             train_on = st.radio(
@@ -561,7 +800,7 @@ with tab_retrain:
                         )
 
                     X, y, _ = prepare_features(train_df, target_col, feature_cols)
-                    result = retrain_with_mlflow(X, y, task_type, retrain_model_name)
+                    result = retrain_with_mlflow(X, y, task_type, retrain_model_name, custom_params=custom_params)
                     st.session_state["retrain_result"] = result
 
                     st.success(
