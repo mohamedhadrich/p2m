@@ -53,15 +53,26 @@ def ks_test(reference: np.ndarray, current: np.ndarray):
 
 def chi2_test(reference: pd.Series, current: pd.Series):
     """Chi-squared test for categorical columns."""
-    all_cats = sorted(set(reference.unique()) | set(current.unique()))
-    ref_counts = reference.value_counts()
-    curr_counts = current.value_counts()
+    # Convert to string to handle mixed types and ensure sortability
+    ref_cats = reference.astype(str).unique()
+    curr_cats = current.astype(str).unique()
+    all_cats = sorted(set(ref_cats) | set(curr_cats))
+    
+    ref_counts = reference.astype(str).value_counts()
+    curr_counts = current.astype(str).value_counts()
 
-    ref_arr = np.array([ref_counts.get(c, 0) for c in all_cats], dtype=float)
-    curr_arr = np.array([curr_counts.get(c, 0) for c in all_cats], dtype=float)
+    ref_arr = np.array([ref_counts.get(str(c), 0) for c in all_cats], dtype=float)
+    curr_arr = np.array([curr_counts.get(str(c), 0) for c in all_cats], dtype=float)
 
-    # Add 1 to avoid zeros
-    stat, pvalue = stats.chisquare(curr_arr + 1, f_exp=ref_arr + 1)
+    # Add pseudocount to avoid zeros
+    pseudocount = 1
+    ref_arr = ref_arr + pseudocount
+    curr_arr = curr_arr + pseudocount
+    
+    # Scale expected frequencies to match observed sum (chi2 requirement)
+    ref_arr = ref_arr * (curr_arr.sum() / ref_arr.sum())
+    
+    stat, pvalue = stats.chisquare(curr_arr, f_exp=ref_arr)
     return float(stat), float(pvalue)
 
 

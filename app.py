@@ -229,7 +229,7 @@ with tab_quality:
                 st.dataframe(missing, use_container_width=True)
                 fig = plot_missing_values(missing)
                 if fig:
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"missing_values_chart_{label}")
         else:
             st.info("✅ No missing values.")
 
@@ -285,7 +285,7 @@ with tab_drift:
         # Summary chart
         fig = plot_drift_summary(drift_result)
         if fig:
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key="drift_summary_chart")
 
         # Detail table
         with st.expander("Detailed results per column"):
@@ -315,7 +315,7 @@ with tab_drift:
                             fig = plot_distribution_comparison(
                                 ref_df[col].dropna(), curr_df[col].dropna(), col
                             )
-                            st.plotly_chart(fig, use_container_width=True)
+                            st.plotly_chart(fig, use_container_width=True, key=f"dist_plot_{col}")
 
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  TAB 4 — Performance                                         ║
