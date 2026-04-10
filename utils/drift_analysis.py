@@ -63,23 +63,27 @@ def analyze_drift_topology(
     else:
         perf_dropped = False
         max_drop = 0.0
-        
+
         for metric_name, ref_val in ref_perf.metrics.items():
             curr_val = curr_perf.metrics.get(metric_name)
             if curr_val is None:
                 continue
-            
-            # For error metrics (MSE, RMSE, MAE), increase = worse
+
+            # Uniform formula: change = (curr - ref) / ref
+            change = (curr_val - ref_val) / max(abs(ref_val), 1e-8)
+
+            # For error metrics (MSE, RMSE, MAE): negative = improvement
             if metric_name in ("MSE", "RMSE", "MAE"):
-                change = (curr_val - ref_val) / max(abs(ref_val), 1e-8)
+                # Positive change = degradation
+                max_drop = max(max_drop, change)
             else:
-                # For performance metrics (Accuracy, F1, R2), decrease = worse
-                change = (ref_val - curr_val) / max(abs(ref_val), 1e-8)
-            
-            max_drop = max(max_drop, change)
-        
+                # For score metrics (Accuracy, F1, R²): negative = degradation
+                # Convert to positive degradation indicator
+                neg_change = -change
+                max_drop = max(max_drop, neg_change)
+
         perf_dropped = max_drop > perf_threshold
-        
+
         if max_drop >= 0.15:
             model_drift_severity = "Strong"
         elif max_drop >= perf_threshold:

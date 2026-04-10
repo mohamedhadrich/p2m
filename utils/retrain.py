@@ -7,26 +7,179 @@ from sklearn.ensemble import (
     RandomForestRegressor,
     GradientBoostingClassifier,
     GradientBoostingRegressor,
+    AdaBoostClassifier,
+    AdaBoostRegressor,
 )
 from sklearn.linear_model import LogisticRegression, LinearRegression
-from sklearn.model_selection import cross_val_score
-from sklearn.preprocessing import LabelEncoder
+from sklearn.svm import SVC, SVR
+from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+from sklearn.naive_bayes import GaussianNB
+from sklearn.model_selection import cross_val_score, KFold, StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
 from dataclasses import dataclass
 import mlflow
 import mlflow.sklearn
 
-# ── Available models ─────────────────────────────────────────────
+# ── LSTM wrapper for sklearn compatibility ──────────────────────────
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    from tensorflow.keras import layers
+
+    class LSTMRegressor:
+        """LSTM wrapper for regression tasks."""
+        def __init__(self, units=32, epochs=20, batch_size=32, verbose=0):
+            self.units = units
+            self.epochs = epochs
+            self.batch_size = batch_size
+            self.verbose = verbose
+            self.model = None
+            self.scaler = StandardScaler()
+
+        def fit(self, X, y):
+            X = np.asarray(X, dtype=np.float32)
+            y = np.asarray(y, dtype=np.float32)
+
+            # Reshape for LSTM: (samples, timesteps, features)
+            if len(X.shape) == 2:
+                X = X.reshape((X.shape[0], 1, X.shape[1]))
+
+            # Build LSTM model
+            self.model = keras.Sequential([
+                layers.LSTM(self.units, activation='relu', input_shape=(X.shape[1], X.shape[2])),
+                layers.Dense(16, activation='relu'),
+                layers.Dense(1)
+            ])
+            self.model.compile(optimizer='adam', loss='mse')
+            self.model.fit(X, y, epochs=self.epochs, batch_size=self.batch_size,
+                          verbose=self.verbose)
+            return self
+
+        def predict(self, X):
+            X = np.asarray(X, dtype=np.float32)
+            if len(X.shape) == 2:
+                X = X.reshape((X.shape[0], 1, X.shape[1]))
+            return self.model.predict(X, verbose=0).flatten()
+
+    class LSTMClassifier:
+        """LSTM wrapper for classification tasks."""
+        def __init__(self, units=32, epochs=20, batch_size=32, verbose=0):
+            self.units = units
+            self.epochs = epochs
+            self.batch_size = batch_size
+            self.verbose = verbose
+            self.model = None
+            self.classes_ = None
+            self.n_classes_ = None
+
+        def fit(self, X, y):
+            X = np.asarray(X, dtype=np.float32)
+            y = np.asarray(y)
+
+            # Handle label encoding
+            if y.dtype == object or y.dtype.kind in ['U', 'S']:
+                le = LabelEncoder()
+                y = le.fit_transform(y)
+                self.classes_ = le.classes_
+            else:
+                self.classes_ = np.unique(y)
+
+            self.n_classes_ = len(self.classes_)
+            y_encoded = y if self.n_classes_ == 2 else keras.utils.to_categorical(y, self.n_classes_)
+
+            # Reshape for LSTM: (samples, timesteps, features)
+            if len(X.shape) == 2:
+                X = X.reshape((X.shape[0], 1, X.shape[1]))
+
+            # Build LSTM model
+            if self.n_classes_ == 2:
+                self.model = keras.Sequential([
+                    layers.LSTM(self.units, activation='relu', input_shape=(X.shape[1], X.shape[2])),
+                    layers.Dense(16, activation='relu'),
+                    layers.Dense(1, activation='sigmoid')
+                ])
+                self.model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+            else:
+                self.model = keras.Sequential([
+                    layers.LSTM(self.units, activation='relu', input_shape=(X.shape[1], X.shape[2])),
+                    layers.Dense(32, activation='relu'),
+                    layers.Dense(self.n_classes_, activation='softmax')
+                ])
+                self.model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+            self.model.fit(X, y_encoded, epochs=self.epochs, batch_size=self.batch_size,
+                          verbose=self.verbose)
+            return self
+
+        def predict(self, X):
+            X = np.asarray(X, dtype=np.float32)
+            if len(X.shape) == 2:
+                X = X.reshape((X.shape[0], 1, X.shape[1]))
+
+            probs = self.model.predict(X, verbose=0)
+            if self.n_classes_ == 2:
+                return self.classes_[(probs > 0.5).astype(int).flatten()]
+            else:
+                return self.classes_[np.argmax(probs, axis=1)]
+
+        def predict_proba(self, X):
+            X = np.asarray(X, dtype=np.float32)
+            if len(X.shape) == 2:
+                X = X.reshape((X.shape[0], 1, X.shape[1]))
+
+            probs = self.model.predict(X, verbose=0)
+            if self.n_classes_ == 2:
+                probs_binary = np.column_stack([1 - probs, probs])
+                return probs_binary
+            else:
+                return probs
+
+    LSTM_AVAILABLE = True
+except ImportError:
+    LSTM_AVAILABLE = False
+
+# ── Available models with default parameters ──────────────────────
 MODELS = {
     "classification": {
-        "Random Forest": RandomForestClassifier,
         "Logistic Regression": LogisticRegression,
+        "Random Forest": RandomForestClassifier,
         "Gradient Boosting": GradientBoostingClassifier,
+        "SVM": SVC,
+        "K-Nearest Neighbors": KNeighborsClassifier,
+        "Decision Tree": DecisionTreeClassifier,
+        "Naive Bayes": GaussianNB,
+        "AdaBoost": AdaBoostClassifier,
     },
     "regression": {
-        "Random Forest": RandomForestRegressor,
         "Linear Regression": LinearRegression,
+        "Random Forest": RandomForestRegressor,
         "Gradient Boosting": GradientBoostingRegressor,
+        "SVM": SVR,
+        "K-Nearest Neighbors": KNeighborsRegressor,
+        "Decision Tree": DecisionTreeRegressor,
+        "AdaBoost": AdaBoostRegressor,
     },
+}
+
+# Add LSTM if TensorFlow is available
+if LSTM_AVAILABLE:
+    MODELS["classification"]["LSTM"] = LSTMClassifier
+    MODELS["regression"]["LSTM"] = LSTMRegressor
+
+# ── Default hyperparameters per model ──────────────────────────────
+DEFAULT_PARAMS = {
+    "Logistic Regression": {"max_iter": 1000, "random_state": 42, "C": 1.0},
+    "Random Forest": {"n_estimators": 100, "max_depth": 10, "random_state": 42, "n_jobs": -1},
+    "Gradient Boosting": {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 5, "random_state": 42},
+    "SVM": {"kernel": "rbf", "C": 1.0, "gamma": "scale", "random_state": 42},
+    "K-Nearest Neighbors": {"n_neighbors": 5, "weights": "uniform"},
+    "Decision Tree": {"max_depth": 10, "min_samples_split": 5, "random_state": 42},
+    "Naive Bayes": {},
+    "AdaBoost": {"n_estimators": 50, "learning_rate": 1.0, "random_state": 42},
+    "Linear Regression": {},
+    "LSTM": {"units": 32, "epochs": 20, "batch_size": 32, "verbose": 0},
 }
 
 
@@ -91,19 +244,61 @@ def train_model(
     y: pd.Series,
     task_type: str,
     model_name: str = "Random Forest",
+    custom_params: dict = None,
+    scale_features: bool = True,
 ):
-    """Instantiate and fit a scikit-learn model."""
+    """Instantiate and fit a scikit-learn model with optional custom parameters.
+
+    Args:
+        X: Feature matrix
+        y: Target vector
+        task_type: 'classification' or 'regression'
+        model_name: Name of model to use
+        custom_params: Dictionary of custom hyperparameters (overrides defaults)
+        scale_features: Whether to scale features (important for SVM, KNN)
+    """
     model_class = MODELS[task_type][model_name]
 
-    if model_name == "Logistic Regression":
-        model = model_class(max_iter=1000, random_state=42)
-    elif model_name in ("Random Forest", "Gradient Boosting"):
-        model = model_class(n_estimators=100, random_state=42)
+    # Get default parameters
+    params = DEFAULT_PARAMS.get(model_name, {}).copy()
+
+    # Override with custom parameters if provided
+    if custom_params:
+        params.update(custom_params)
+
+    # Build model (Pipeline for scaling-sensitive estimators)
+    base_model = model_class(**params)
+    if scale_features and model_name in ["SVM", "K-Nearest Neighbors"]:
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", base_model),
+        ])
     else:
-        model = model_class()
+        model = base_model
 
     model.fit(X, y)
     return model
+
+
+def _get_default_scoring(task_type: str) -> str:
+    return "f1_weighted" if task_type == "classification" else "neg_mean_squared_error"
+
+
+def _get_cv_splitter(task_type: str, y: pd.Series, n_splits: int):
+    """Return a robust CV splitter by task type.
+
+    Classification uses stratification when feasible. If class counts are too
+    small for stratification, fallback to KFold to keep the process running.
+    """
+    n_splits = max(2, n_splits)
+    if task_type == "classification":
+        y_series = pd.Series(y)
+        min_class_count = int(y_series.value_counts(dropna=False).min())
+        if min_class_count >= 2:
+            safe_splits = min(n_splits, min_class_count)
+            safe_splits = max(2, safe_splits)
+            return StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
+    return KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
 
 # ── Retrain + MLflow ─────────────────────────────────────────────
@@ -112,25 +307,52 @@ def retrain_with_mlflow(
     y: pd.Series,
     task_type: str,
     model_name: str,
+    custom_params: dict = None,
     experiment_name: str = "drift-retrain",
+    scoring_metric: str = None,
 ) -> RetrainResult:
-    """Train, cross-validate, and log the run to MLflow."""
+    """Train, cross-validate, and log the run to MLflow.
+
+    Args:
+        X: Feature matrix
+        y: Target vector
+        task_type: 'classification' or 'regression'
+        model_name: Name of model to use
+        custom_params: Dictionary of custom hyperparameters
+        experiment_name: MLflow experiment name
+    """
     mlflow.set_tracking_uri("file:./mlruns")
     mlflow.set_experiment(experiment_name)
 
     with mlflow.start_run(run_name=f"retrain-{model_name}") as run:
-        model = train_model(X, y, task_type, model_name)
+        model = train_model(X, y, task_type, model_name, custom_params=custom_params)
 
-        scoring = (
-            "f1_weighted" if task_type == "classification" else "neg_mean_squared_error"
-        )
+        scoring = scoring_metric or _get_default_scoring(task_type)
         n_splits = min(5, max(2, len(y) // 10))
-        cv_scores = cross_val_score(model, X, y, cv=n_splits, scoring=scoring)
+
+        # Build a fresh estimator for leakage-safe CV.
+        cv_model = train_model(
+            X,
+            y,
+            task_type,
+            model_name,
+            custom_params=custom_params,
+            scale_features=True,
+        )
+        splitter = _get_cv_splitter(task_type, y, n_splits)
+        cv_scores = cross_val_score(cv_model, X, y, cv=splitter, scoring=scoring)
 
         mlflow.log_param("model_name", model_name)
         mlflow.log_param("task_type", task_type)
         mlflow.log_param("n_features", X.shape[1])
         mlflow.log_param("n_samples", X.shape[0])
+        mlflow.log_param("cv_scoring", scoring)
+
+        # Log custom parameters if provided
+        if custom_params:
+            for param_name, param_value in custom_params.items():
+                mlflow.log_param(f"custom_{param_name}", param_value)
+
         mlflow.log_metric("cv_score_mean", cv_scores.mean())
         mlflow.log_metric("cv_score_std", cv_scores.std())
         mlflow.sklearn.log_model(model, "model")
@@ -147,3 +369,380 @@ def retrain_with_mlflow(
             task_type=task_type,
             run_id=run.info.run_id,
         )
+
+
+# ── Helper functions for parameter management ───────────────────
+def get_default_params(model_name: str) -> dict:
+    """Get default hyperparameters for a model."""
+    return DEFAULT_PARAMS.get(model_name, {}).copy()
+
+
+def get_parameter_info(model_name: str) -> dict:
+    """Get information about parameters for a specific model.
+
+    Returns:
+        Dictionary with parameter names and their default values/types
+    """
+    defaults = get_default_params(model_name)
+
+    # Define parameter info (type hints for UI)
+    param_info = {
+        # Logistic Regression
+        "C": ("float", 0.1, 10.0),
+        "max_iter": ("int", 100, 5000),
+
+        # Random Forest
+        "n_estimators": ("int", 10, 500),
+        "max_depth": ("int", 2, 30),
+
+        # Gradient Boosting
+        "learning_rate": ("float", 0.01, 1.0),
+
+        # SVM
+        "kernel": ("select", ["linear", "rbf", "poly"]),
+        "gamma": ("select", ["scale", "auto"]),
+
+        # K-Nearest Neighbors
+        "n_neighbors": ("int", 1, 50),
+        "weights": ("select", ["uniform", "distance"]),
+
+        # Decision Tree
+        "min_samples_split": ("int", 2, 20),
+
+        # AdaBoost
+
+        # LSTM
+        "units": ("int", 16, 128),
+        "epochs": ("int", 10, 50),
+        "batch_size": ("select", [16, 32, 64, 128]),
+    }
+
+    return defaults, param_info
+
+
+# ── Model and parameter optimization ────────────────────────────
+from dataclasses import dataclass
+
+@dataclass
+class ModelRecommendation:
+    """Recommendation for best model and parameters."""
+    model_name: str
+    params: dict
+    cv_score: float
+    cv_std: float
+    training_time: float
+    scoring_metric: str = ""
+
+
+@dataclass
+class AgentRecommendationReport:
+    """Structured output from the model-selection agent."""
+    best: ModelRecommendation
+    leaderboard: list
+    objective: str
+    rationale: str
+
+
+class ModelSelectionAgent:
+    """Lightweight AutoML-style agent that recommends model + parameters.
+
+    The agent reuses cross-validation benchmarks from `find_best_model_and_params`
+    and applies a configurable objective to select the final recommendation.
+    """
+
+    def __init__(
+        self,
+        task_type: str,
+        cv_folds: int = 3,
+        quick_mode: bool = True,
+        objective: str = "score_first",
+        scoring_metric: str = None,
+        context: dict = None,
+        include_lstm: bool = False,
+    ):
+        self.task_type = task_type
+        self.cv_folds = cv_folds
+        self.quick_mode = quick_mode
+        self.objective = objective
+        self.scoring_metric = scoring_metric or _get_default_scoring(task_type)
+        self.context = context or {}
+        self.include_lstm = include_lstm
+
+    def _is_severe_context(self) -> bool:
+        drift_detected = bool(self.context.get("drift_detected", False))
+        perf_dropped = bool(self.context.get("perf_dropped", False))
+        drift_pct = float(self.context.get("drift_pct", 0.0) or 0.0)
+        drift_severity = str(self.context.get("drift_severity", "")).lower()
+        severe_label = drift_severity in {"strong", "high", "critical"}
+        return (drift_detected and perf_dropped) or drift_pct >= 0.3 or severe_label
+
+    def _ensemble_bonus(self, rec: ModelRecommendation) -> float:
+        if not self._is_severe_context():
+            return 0.0
+        if rec.model_name in {"Random Forest", "Gradient Boosting", "AdaBoost"}:
+            return 0.01 if self.task_type == "classification" else 0.1
+        return 0.0
+
+    def _selection_key(self, rec: ModelRecommendation):
+        """Ranking key for final recommendation based on selected objective."""
+        ensemble_bonus = self._ensemble_bonus(rec)
+        if self.objective == "balanced":
+            # Favor strong scores while penalizing instability and slow training.
+            return rec.cv_score - (0.5 * rec.cv_std) - (0.001 * rec.training_time) + ensemble_bonus
+        if self.objective == "fast":
+            # Prefer faster models when score is close.
+            return rec.cv_score - (0.005 * rec.training_time) + (0.25 * ensemble_bonus)
+        # Default: maximize validation score.
+        return rec.cv_score + ensemble_bonus
+
+    def _build_rationale(self, best: ModelRecommendation, top_candidates: list) -> str:
+        """Explain why the model was selected in concise natural language."""
+        score_label = best.scoring_metric or self.scoring_metric
+        rationale = (
+            f"Selected {best.model_name} with params {best.params} because it produced "
+            f"the strongest {score_label} CV performance "
+            f"({best.cv_score:.4f} +/- {best.cv_std:.4f})"
+        )
+        if self.objective != "score_first":
+            rationale += (
+                f" under '{self.objective}' objective"
+                f" and completed in {best.training_time:.2f}s"
+            )
+        if len(top_candidates) > 1:
+            second = top_candidates[1]
+            gap = best.cv_score - second.cv_score
+            rationale += f". Margin vs second-best: {gap:+.4f} CV score"
+        if self._is_severe_context() and best.model_name in {"Random Forest", "Gradient Boosting", "AdaBoost"}:
+            rationale += ". Drift/performance context is severe, so a robust ensemble was slightly favored"
+        rationale += "."
+        return rationale
+
+    def recommend(self, X: pd.DataFrame, y: pd.Series, top_k: int = 5) -> AgentRecommendationReport:
+        """Run candidate search and return best recommendation + leaderboard."""
+        candidates = find_best_model_and_params(
+            X=X,
+            y=y,
+            task_type=self.task_type,
+            cv_folds=self.cv_folds,
+            quick_mode=self.quick_mode,
+            scoring_metric=self.scoring_metric,
+            include_lstm=self.include_lstm,
+        )
+
+        if not candidates:
+            raise ValueError("No valid model candidates were found for recommendation.")
+
+        ranked = sorted(candidates, key=self._selection_key, reverse=True)
+        best = ranked[0]
+        leaderboard = ranked[: max(1, top_k)]
+        rationale = self._build_rationale(best, leaderboard)
+
+        return AgentRecommendationReport(
+            best=best,
+            leaderboard=leaderboard,
+            objective=self.objective,
+            rationale=rationale,
+        )
+
+
+def find_best_model_and_params(
+    X: pd.DataFrame,
+    y: pd.Series,
+    task_type: str,
+    cv_folds: int = 3,
+    quick_mode: bool = True,
+    scoring_metric: str = None,
+    include_lstm: bool = False,
+) -> list:
+    """Find best model and hyperparameters using grid search.
+
+    Args:
+        X: Feature matrix
+        y: Target vector
+        task_type: 'classification' or 'regression'
+        cv_folds: Number of cross-validation folds
+        quick_mode: If True, test fewer parameter combinations
+
+    Returns:
+        List of ModelRecommendation objects sorted by performance
+    """
+    import time
+    from sklearn.model_selection import cross_validate
+
+    results = []
+    model_options = MODELS[task_type]
+
+    # Define parameter grids for each model
+    param_grids = {
+        "Logistic Regression": [
+            {"C": 0.1, "max_iter": 1000},
+            {"C": 1.0, "max_iter": 1000},
+            {"C": 10.0, "max_iter": 1000},
+        ] if not quick_mode else [
+            {"C": 1.0, "max_iter": 1000},
+        ],
+
+        "Random Forest": [
+            {"n_estimators": 50, "max_depth": 5},
+            {"n_estimators": 100, "max_depth": 10},
+            {"n_estimators": 200, "max_depth": 15},
+        ] if not quick_mode else [
+            {"n_estimators": 100, "max_depth": 10},
+        ],
+
+        "Gradient Boosting": [
+            {"n_estimators": 50, "learning_rate": 0.1, "max_depth": 3},
+            {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 5},
+        ] if not quick_mode else [
+            {"n_estimators": 100, "learning_rate": 0.1, "max_depth": 5},
+        ],
+
+        "SVM": [
+            {"kernel": "rbf", "C": 1.0},
+            {"kernel": "linear", "C": 1.0},
+        ] if not quick_mode else [
+            {"kernel": "rbf", "C": 1.0},
+        ],
+
+        "K-Nearest Neighbors": [
+            {"n_neighbors": 3, "weights": "uniform"},
+            {"n_neighbors": 5, "weights": "distance"},
+        ] if not quick_mode else [
+            {"n_neighbors": 5, "weights": "uniform"},
+        ],
+
+        "Decision Tree": [
+            {"max_depth": 5, "min_samples_split": 5},
+            {"max_depth": 10, "min_samples_split": 2},
+        ] if not quick_mode else [
+            {"max_depth": 10, "min_samples_split": 5},
+        ],
+
+        "Naive Bayes": [{}],
+
+        "AdaBoost": [
+            {"n_estimators": 50, "learning_rate": 1.0},
+            {"n_estimators": 100, "learning_rate": 0.5},
+        ] if not quick_mode else [
+            {"n_estimators": 50, "learning_rate": 1.0},
+        ],
+
+        "Linear Regression": [{}],
+
+        "LSTM": [
+            {"units": 32, "epochs": 15, "batch_size": 32},
+            {"units": 64, "epochs": 20, "batch_size": 16},
+        ] if not quick_mode else [
+            {"units": 32, "epochs": 10, "batch_size": 32},
+        ] if LSTM_AVAILABLE else [],
+    }
+
+    scoring = scoring_metric or _get_default_scoring(task_type)
+    splitter = _get_cv_splitter(task_type, y, cv_folds)
+
+    # Test each model with different parameter combinations
+    for model_name, model_class in model_options.items():
+        # LSTM is excluded from default tabular search because it is primarily
+        # designed for sequential/time-series structure; include only when
+        # explicitly requested.
+        if model_name == "LSTM" and not include_lstm:
+            continue
+
+        param_combinations = param_grids.get(model_name, [{}])
+
+        for params in param_combinations:
+            try:
+                # Get full params with defaults
+                full_params = get_default_params(model_name).copy()
+                full_params.update(params)
+
+                # Create estimator
+                start_time = time.time()
+                model = model_class(**full_params)
+
+                # Handle LSTM separately (custom cross-validation)
+                if model_name == "LSTM" and LSTM_AVAILABLE:
+                    fold_scores = []
+
+                    X_values = X.to_numpy()
+                    for train_idx, test_idx in splitter.split(X_values, y):
+                        X_fold_train, X_fold_test = X_values[train_idx], X_values[test_idx]
+                        y_fold_train, y_fold_test = y.iloc[train_idx], y.iloc[test_idx]
+
+                        lstm_fold = model_class(**full_params)
+                        lstm_fold.fit(X_fold_train, y_fold_train)
+
+                        if task_type == "classification":
+                            fold_score = lstm_fold.model.evaluate(
+                                np.asarray(X_fold_test, dtype=np.float32).reshape(
+                                    X_fold_test.shape[0], 1, X_fold_test.shape[1]
+                                ),
+                                y_fold_test, verbose=0
+                            )[1]
+                        else:
+                            fold_score = lstm_fold.model.evaluate(
+                                np.asarray(X_fold_test, dtype=np.float32).reshape(
+                                    X_fold_test.shape[0], 1, X_fold_test.shape[1]
+                                ),
+                                y_fold_test, verbose=0
+                            )
+                            fold_score = -fold_score
+
+                        fold_scores.append(fold_score)
+
+                    training_time = time.time() - start_time
+                    cv_score = np.mean(fold_scores)
+                    cv_std = np.std(fold_scores)
+                else:
+                    # Leakage-safe CV via Pipeline for scaling-sensitive models.
+                    if model_name in ["SVM", "K-Nearest Neighbors"]:
+                        model = Pipeline([
+                            ("scaler", StandardScaler()),
+                            ("model", model),
+                        ])
+
+                    cv_results = cross_validate(
+                        model, X, y, cv=splitter, scoring=scoring,
+                        return_train_score=False
+                    )
+
+                    training_time = time.time() - start_time
+                    cv_score = cv_results['test_score'].mean()
+                    cv_std = cv_results['test_score'].std()
+
+                # Store result
+                recommendation = ModelRecommendation(
+                    model_name=model_name,
+                    params=params,
+                    cv_score=cv_score,
+                    cv_std=cv_std,
+                    training_time=training_time,
+                    scoring_metric=scoring,
+                )
+                results.append(recommendation)
+
+            except Exception as e:
+                print(f"Error testing {model_name} with {params}: {e}")
+                continue
+
+    # Sort by score (higher is better for f1, higher is better for negative MSE)
+    results.sort(key=lambda x: x.cv_score, reverse=True)
+
+    return results
+
+
+def format_recommendation_for_display(recommendation: ModelRecommendation, task_type: str) -> dict:
+    """Format recommendation for display in Streamlit.
+
+    Returns:
+        Dictionary with formatted display info
+    """
+    metric_name = "F1 Score" if task_type == "classification" else "MSE"
+
+    return {
+        "Model": recommendation.model_name,
+        "Parameters": str(recommendation.params),
+        metric_name: f"{recommendation.cv_score:.4f}",
+        "Std Dev": f"{recommendation.cv_std:.4f}",
+        "Training Time (s)": f"{recommendation.training_time:.2f}",
+    }
