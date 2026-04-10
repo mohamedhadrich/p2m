@@ -15,8 +15,9 @@ from sklearn.svm import SVC, SVR
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.naive_bayes import GaussianNB
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
 from dataclasses import dataclass
 import mlflow
 import mlflow.sklearn
@@ -265,19 +266,39 @@ def train_model(
     if custom_params:
         params.update(custom_params)
 
-    # Create model instance
-    model = model_class(**params)
-
-    # Scale features for models that benefit from it
-    X_train = X.copy()
+    # Build model (Pipeline for scaling-sensitive estimators)
+    base_model = model_class(**params)
     if scale_features and model_name in ["SVM", "K-Nearest Neighbors"]:
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X)
-        model.scaler = scaler  # Store scaler for later use
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("model", base_model),
+        ])
+    else:
+        model = base_model
 
-    # Fit model
-    model.fit(X_train, y)
+    model.fit(X, y)
     return model
+
+
+def _get_default_scoring(task_type: str) -> str:
+    return "f1_weighted" if task_type == "classification" else "neg_mean_squared_error"
+
+
+def _get_cv_splitter(task_type: str, y: pd.Series, n_splits: int):
+    """Return a robust CV splitter by task type.
+
+    Classification uses stratification when feasible. If class counts are too
+    small for stratification, fallback to KFold to keep the process running.
+    """
+    n_splits = max(2, n_splits)
+    if task_type == "classification":
+        y_series = pd.Series(y)
+        min_class_count = int(y_series.value_counts(dropna=False).min())
+        if min_class_count >= 2:
+            safe_splits = min(n_splits, min_class_count)
+            safe_splits = max(2, safe_splits)
+            return StratifiedKFold(n_splits=safe_splits, shuffle=True, random_state=42)
+    return KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
 
 # ── Retrain + MLflow ─────────────────────────────────────────────
@@ -288,6 +309,7 @@ def retrain_with_mlflow(
     model_name: str,
     custom_params: dict = None,
     experiment_name: str = "drift-retrain",
+    scoring_metric: str = None,
 ) -> RetrainResult:
     """Train, cross-validate, and log the run to MLflow.
 
@@ -305,20 +327,26 @@ def retrain_with_mlflow(
     with mlflow.start_run(run_name=f"retrain-{model_name}") as run:
         model = train_model(X, y, task_type, model_name, custom_params=custom_params)
 
-        scoring = (
-            "f1_weighted" if task_type == "classification" else "neg_mean_squared_error"
-        )
+        scoring = scoring_metric or _get_default_scoring(task_type)
         n_splits = min(5, max(2, len(y) // 10))
 
-        # Use KFold with fixed random_state for reproducible CV splits
-        from sklearn.model_selection import KFold
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_scores = cross_val_score(model, X, y, cv=kf, scoring=scoring)
+        # Build a fresh estimator for leakage-safe CV.
+        cv_model = train_model(
+            X,
+            y,
+            task_type,
+            model_name,
+            custom_params=custom_params,
+            scale_features=True,
+        )
+        splitter = _get_cv_splitter(task_type, y, n_splits)
+        cv_scores = cross_val_score(cv_model, X, y, cv=splitter, scoring=scoring)
 
         mlflow.log_param("model_name", model_name)
         mlflow.log_param("task_type", task_type)
         mlflow.log_param("n_features", X.shape[1])
         mlflow.log_param("n_samples", X.shape[0])
+        mlflow.log_param("cv_scoring", scoring)
 
         # Log custom parameters if provided
         if custom_params:
@@ -403,6 +431,118 @@ class ModelRecommendation:
     cv_score: float
     cv_std: float
     training_time: float
+    scoring_metric: str = ""
+
+
+@dataclass
+class AgentRecommendationReport:
+    """Structured output from the model-selection agent."""
+    best: ModelRecommendation
+    leaderboard: list
+    objective: str
+    rationale: str
+
+
+class ModelSelectionAgent:
+    """Lightweight AutoML-style agent that recommends model + parameters.
+
+    The agent reuses cross-validation benchmarks from `find_best_model_and_params`
+    and applies a configurable objective to select the final recommendation.
+    """
+
+    def __init__(
+        self,
+        task_type: str,
+        cv_folds: int = 3,
+        quick_mode: bool = True,
+        objective: str = "score_first",
+        scoring_metric: str = None,
+        context: dict = None,
+        include_lstm: bool = False,
+    ):
+        self.task_type = task_type
+        self.cv_folds = cv_folds
+        self.quick_mode = quick_mode
+        self.objective = objective
+        self.scoring_metric = scoring_metric or _get_default_scoring(task_type)
+        self.context = context or {}
+        self.include_lstm = include_lstm
+
+    def _is_severe_context(self) -> bool:
+        drift_detected = bool(self.context.get("drift_detected", False))
+        perf_dropped = bool(self.context.get("perf_dropped", False))
+        drift_pct = float(self.context.get("drift_pct", 0.0) or 0.0)
+        drift_severity = str(self.context.get("drift_severity", "")).lower()
+        severe_label = drift_severity in {"strong", "high", "critical"}
+        return (drift_detected and perf_dropped) or drift_pct >= 0.3 or severe_label
+
+    def _ensemble_bonus(self, rec: ModelRecommendation) -> float:
+        if not self._is_severe_context():
+            return 0.0
+        if rec.model_name in {"Random Forest", "Gradient Boosting", "AdaBoost"}:
+            return 0.01 if self.task_type == "classification" else 0.1
+        return 0.0
+
+    def _selection_key(self, rec: ModelRecommendation):
+        """Ranking key for final recommendation based on selected objective."""
+        ensemble_bonus = self._ensemble_bonus(rec)
+        if self.objective == "balanced":
+            # Favor strong scores while penalizing instability and slow training.
+            return rec.cv_score - (0.5 * rec.cv_std) - (0.001 * rec.training_time) + ensemble_bonus
+        if self.objective == "fast":
+            # Prefer faster models when score is close.
+            return rec.cv_score - (0.005 * rec.training_time) + (0.25 * ensemble_bonus)
+        # Default: maximize validation score.
+        return rec.cv_score + ensemble_bonus
+
+    def _build_rationale(self, best: ModelRecommendation, top_candidates: list) -> str:
+        """Explain why the model was selected in concise natural language."""
+        score_label = best.scoring_metric or self.scoring_metric
+        rationale = (
+            f"Selected {best.model_name} with params {best.params} because it produced "
+            f"the strongest {score_label} CV performance "
+            f"({best.cv_score:.4f} +/- {best.cv_std:.4f})"
+        )
+        if self.objective != "score_first":
+            rationale += (
+                f" under '{self.objective}' objective"
+                f" and completed in {best.training_time:.2f}s"
+            )
+        if len(top_candidates) > 1:
+            second = top_candidates[1]
+            gap = best.cv_score - second.cv_score
+            rationale += f". Margin vs second-best: {gap:+.4f} CV score"
+        if self._is_severe_context() and best.model_name in {"Random Forest", "Gradient Boosting", "AdaBoost"}:
+            rationale += ". Drift/performance context is severe, so a robust ensemble was slightly favored"
+        rationale += "."
+        return rationale
+
+    def recommend(self, X: pd.DataFrame, y: pd.Series, top_k: int = 5) -> AgentRecommendationReport:
+        """Run candidate search and return best recommendation + leaderboard."""
+        candidates = find_best_model_and_params(
+            X=X,
+            y=y,
+            task_type=self.task_type,
+            cv_folds=self.cv_folds,
+            quick_mode=self.quick_mode,
+            scoring_metric=self.scoring_metric,
+            include_lstm=self.include_lstm,
+        )
+
+        if not candidates:
+            raise ValueError("No valid model candidates were found for recommendation.")
+
+        ranked = sorted(candidates, key=self._selection_key, reverse=True)
+        best = ranked[0]
+        leaderboard = ranked[: max(1, top_k)]
+        rationale = self._build_rationale(best, leaderboard)
+
+        return AgentRecommendationReport(
+            best=best,
+            leaderboard=leaderboard,
+            objective=self.objective,
+            rationale=rationale,
+        )
 
 
 def find_best_model_and_params(
@@ -411,6 +551,8 @@ def find_best_model_and_params(
     task_type: str,
     cv_folds: int = 3,
     quick_mode: bool = True,
+    scoring_metric: str = None,
+    include_lstm: bool = False,
 ) -> list:
     """Find best model and hyperparameters using grid search.
 
@@ -495,10 +637,17 @@ def find_best_model_and_params(
         ] if LSTM_AVAILABLE else [],
     }
 
-    scoring = "f1_weighted" if task_type == "classification" else "neg_mean_squared_error"
+    scoring = scoring_metric or _get_default_scoring(task_type)
+    splitter = _get_cv_splitter(task_type, y, cv_folds)
 
     # Test each model with different parameter combinations
     for model_name, model_class in model_options.items():
+        # LSTM is excluded from default tabular search because it is primarily
+        # designed for sequential/time-series structure; include only when
+        # explicitly requested.
+        if model_name == "LSTM" and not include_lstm:
+            continue
+
         param_combinations = param_grids.get(model_name, [{}])
 
         for params in param_combinations:
@@ -507,24 +656,17 @@ def find_best_model_and_params(
                 full_params = get_default_params(model_name).copy()
                 full_params.update(params)
 
-                # Create and train model
+                # Create estimator
                 start_time = time.time()
                 model = model_class(**full_params)
 
-                # Apply scaling if needed
-                X_train = X.copy()
-                if model_name in ["SVM", "K-Nearest Neighbors"]:
-                    scaler = StandardScaler()
-                    X_train = scaler.fit_transform(X)
-
                 # Handle LSTM separately (custom cross-validation)
                 if model_name == "LSTM" and LSTM_AVAILABLE:
-                    from sklearn.model_selection import KFold
-                    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
                     fold_scores = []
 
-                    for train_idx, test_idx in kf.split(X_train):
-                        X_fold_train, X_fold_test = X_train[train_idx], X_train[test_idx]
+                    X_values = X.to_numpy()
+                    for train_idx, test_idx in splitter.split(X_values, y):
+                        X_fold_train, X_fold_test = X_values[train_idx], X_values[test_idx]
                         y_fold_train, y_fold_test = y.iloc[train_idx], y.iloc[test_idx]
 
                         lstm_fold = model_class(**full_params)
@@ -552,11 +694,15 @@ def find_best_model_and_params(
                     cv_score = np.mean(fold_scores)
                     cv_std = np.std(fold_scores)
                 else:
-                    # Cross-validate for sklearn models with fixed random_state
-                    from sklearn.model_selection import KFold
-                    kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+                    # Leakage-safe CV via Pipeline for scaling-sensitive models.
+                    if model_name in ["SVM", "K-Nearest Neighbors"]:
+                        model = Pipeline([
+                            ("scaler", StandardScaler()),
+                            ("model", model),
+                        ])
+
                     cv_results = cross_validate(
-                        model, X_train, y, cv=kf, scoring=scoring,
+                        model, X, y, cv=splitter, scoring=scoring,
                         return_train_score=False
                     )
 
@@ -570,7 +716,8 @@ def find_best_model_and_params(
                     params=params,
                     cv_score=cv_score,
                     cv_std=cv_std,
-                    training_time=training_time
+                    training_time=training_time,
+                    scoring_metric=scoring,
                 )
                 results.append(recommendation)
 

@@ -21,9 +21,31 @@ class PerformanceResult:
 
 
 def detect_task_type(y: pd.Series) -> str:
-    """Heuristic: classification if <=20 unique values or non-numeric."""
-    if y.dtype == "object" or y.dtype.name == "category" or y.nunique() <= 20:
+    """Infer task type with a conservative heuristic.
+
+    Logic:
+    - Non-numeric targets are classification.
+    - Numeric targets are classification only when values are integer-like and
+      cardinality is small relative to sample size (typical label encoding case).
+    - Otherwise treat as regression to avoid misclassifying low-cardinality
+      numeric regression targets.
+    """
+    y_non_null = y.dropna()
+    if y_non_null.empty:
         return "classification"
+
+    if y_non_null.dtype == "object" or y_non_null.dtype.name == "category" or y_non_null.dtype == "bool":
+        return "classification"
+
+    if pd.api.types.is_numeric_dtype(y_non_null):
+        unique_count = y_non_null.nunique()
+        n_samples = len(y_non_null)
+        # Integer-like numeric targets with low cardinality are often classes.
+        is_integer_like = np.allclose(y_non_null, np.round(y_non_null), atol=1e-10)
+        relative_cardinality = unique_count / max(1, n_samples)
+        if is_integer_like and unique_count <= 15 and relative_cardinality <= 0.2:
+            return "classification"
+
     return "regression"
 
 
@@ -32,7 +54,13 @@ def evaluate_model(model, X, y, task_type: str = None) -> PerformanceResult:
     if task_type is None:
         task_type = detect_task_type(y)
 
-    y_pred = model.predict(X)
+    X_eval = X
+    # Backward-compatibility: older training flow may store a fitted scaler
+    # directly on the model instance instead of using a sklearn Pipeline.
+    if hasattr(model, "scaler") and getattr(model, "scaler") is not None:
+        X_eval = model.scaler.transform(X)
+
+    y_pred = model.predict(X_eval)
 
     if task_type == "classification":
         avg = "binary" if len(set(y)) <= 2 else "weighted"
@@ -104,3 +132,66 @@ def check_performance_drop(
             "degraded": degraded,
         }
     return drops
+
+
+def deployment_readiness(
+    old_result: PerformanceResult,
+    new_result: PerformanceResult,
+    min_improvement: float = 0.0,
+) -> dict:
+    """Return whether the new model is better enough to deploy.
+
+    Decision rule uses a primary metric by task:
+    - classification: prefer F1 Score (fallback Accuracy)
+    - regression: prefer RMSE lower-is-better (fallback R² higher-is-better)
+    """
+    task_type = new_result.task_type or old_result.task_type
+    old_metrics = old_result.metrics
+    new_metrics = new_result.metrics
+
+    if task_type == "classification":
+        primary = "F1 Score" if "F1 Score" in new_metrics else "Accuracy"
+        direction = "higher"
+    else:
+        primary = "RMSE" if "RMSE" in new_metrics else "R²"
+        direction = "lower" if primary == "RMSE" else "higher"
+
+    old_val = old_metrics.get(primary)
+    new_val = new_metrics.get(primary)
+
+    if old_val is None or new_val is None:
+        return {
+            "can_deploy": False,
+            "primary_metric": primary,
+            "direction": direction,
+            "old": old_val,
+            "new": new_val,
+            "delta": None,
+            "reason": "Primary metric unavailable for deployment comparison.",
+        }
+
+    delta = new_val - old_val
+    if direction == "higher":
+        improved = delta > min_improvement
+    else:
+        improved = (-delta) > min_improvement
+
+    if improved:
+        reason = (
+            f"New model improves {primary}: {old_val:.4f} -> {new_val:.4f}."
+        )
+    else:
+        reason = (
+            f"New model does not improve {primary} enough: "
+            f"{old_val:.4f} -> {new_val:.4f}."
+        )
+
+    return {
+        "can_deploy": improved,
+        "primary_metric": primary,
+        "direction": direction,
+        "old": float(old_val),
+        "new": float(new_val),
+        "delta": float(delta),
+        "reason": reason,
+    }
