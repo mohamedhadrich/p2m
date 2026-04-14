@@ -8,4 +8,4 @@ mlflow
 streamlit
 plotly
 scipy
-tensorflow
+
