@@ -9,3 +9,4 @@ streamlit
 plotly
 scipy
 protobuf<5
+setuptools
